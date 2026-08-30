@@ -1401,8 +1401,12 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                # for fp8 blockscale, ck has better performance so disable assembly kernel
+                # for fp8 blockscale, ck has better performance so disable assembly kernel.
+                # GLM-5.2 MTP fix: the 1-stage ASM 'fmoe_1tg' path wedges at EP16/DP16 on
+                # gfx950 (mis-tuned fast path); MTP raises token>32 into it. Force CK.
                 run_1stage = token > 32 and (inter_dim % 128 == 0)
+                if get_gfx() == "gfx950" and int(os.environ.get("AITER_FORCE_CK_FMOE", "1")):
+                    run_1stage = False
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
