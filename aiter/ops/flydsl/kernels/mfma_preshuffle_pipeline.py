@@ -9,8 +9,10 @@ Key primitives:
 """
 
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.expr import arith as _arith
@@ -247,6 +249,33 @@ def _unpack_int4_to_int8_pair(packed32):
     return even, odd
 
 
+# W4A16 weights hold OCP e2m1 (MXFP4) codes instead of signed int4 when set. The packing,
+# preshuffle and per-1x32 scale paths are shared with int4; the caller must pass
+# scale = 2^(e8m0 - 127) / 2 because the decode below yields 2 * fp4 as int8.
+_W4_FP4 = os.environ.get("AITER_FLYDSL_W4_FP4", "0") == "1"
+
+
+def _fp4_codes_to_int8x4(codes):
+    """Map 4 e2m1 codes (one per byte, 0..15) to int8 bytes holding 2 * value (exact)."""
+    mag = codes & fx.Int32(0x07070707)
+    pos = _llvm.call_intrinsic(
+        T.i32, "llvm.amdgcn.perm", [fx.Int32(0x0C080604), fx.Int32(0x03020100), mag], [], []
+    )
+    neg = _llvm.call_intrinsic(
+        T.i32, "llvm.amdgcn.perm", [fx.Int32(0xF4F8FAFC), fx.Int32(0xFDFEFF00), mag], [], []
+    )
+    sign = ((codes & fx.Int32(0x08080808)) >> fx.Int32(3)) * fx.Int32(0xFF)
+    return pos ^ ((pos ^ neg) & sign)
+
+
+def _unpack_fp4_to_int8_pair(packed32):
+    """Split a packed e2m1 dword into two int8 dwords (even/odd nibbles), values 2 * fp4."""
+    c_0f = fx.Int32(0x0F0F0F0F)
+    even = _fp4_codes_to_int8x4(packed32 & c_0f)
+    odd = _fp4_codes_to_int8x4((packed32 >> fx.Int32(4)) & c_0f)
+    return even, odd
+
+
 def _pack_i32_pair_to_i64(lo, hi, vector):
     """Pack two i32 values into one i64 via vector bitcast."""
     v2 = vector.from_elements(T.vec(2, T.i32), [lo, hi])
@@ -443,7 +472,10 @@ def unpack_b_w4a16(
             defer_scale16=defer_scale16,
         )
         return (b0, b1)
-    even, odd = _unpack_int4_to_int8_pair(packed32)
+    if _W4_FP4:
+        even, odd = _unpack_fp4_to_int8_pair(packed32)
+    else:
+        even, odd = _unpack_int4_to_int8_pair(packed32)
     b0 = _i8x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_val=scale_val)
     b1 = _i8x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_val=scale_val)
     return (b0, b1)
