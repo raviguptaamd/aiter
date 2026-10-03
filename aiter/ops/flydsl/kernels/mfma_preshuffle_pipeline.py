@@ -255,17 +255,27 @@ def _unpack_int4_to_int8_pair(packed32):
 _W4_FP4 = os.environ.get("AITER_FLYDSL_W4_FP4", "0") == "1"
 
 
+def _raw_i32(v):
+    if isinstance(v, int):
+        v = v - (1 << 32) if v >= (1 << 31) else v
+        return _arith.ConstantOp(T.i32, ir.IntegerAttr.get(T.i32, v)).result
+    return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def _perm_b32(hi, lo, sel):
+    return _llvm.call_intrinsic(
+        T.i32, "llvm.amdgcn.perm", [_raw_i32(hi), _raw_i32(lo), _raw_i32(sel)], [], []
+    )
+
+
 def _fp4_codes_to_int8x4(codes):
     """Map 4 e2m1 codes (one per byte, 0..15) to int8 bytes holding 2 * value (exact)."""
     mag = codes & fx.Int32(0x07070707)
-    pos = _llvm.call_intrinsic(
-        T.i32, "llvm.amdgcn.perm", [fx.Int32(0x0C080604), fx.Int32(0x03020100), mag], [], []
-    )
-    neg = _llvm.call_intrinsic(
-        T.i32, "llvm.amdgcn.perm", [fx.Int32(0xF4F8FAFC), fx.Int32(0xFDFEFF00), mag], [], []
-    )
-    sign = ((codes & fx.Int32(0x08080808)) >> fx.Int32(3)) * fx.Int32(0xFF)
-    return pos ^ ((pos ^ neg) & sign)
+    pos = _perm_b32(0x0C080604, 0x03020100, mag)
+    neg = _perm_b32(0xF4F8FAFC, 0xFDFEFF00, mag)
+    sign = _raw_i32(((codes & fx.Int32(0x08080808)) >> fx.Int32(3)) * fx.Int32(0xFF))
+    diff = _arith.AndIOp(_arith.XOrIOp(pos, neg).result, sign).result
+    return _arith.XOrIOp(pos, diff).result
 
 
 def _unpack_fp4_to_int8_pair(packed32):
